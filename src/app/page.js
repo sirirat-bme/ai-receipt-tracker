@@ -6,6 +6,8 @@ const CATEGORIES = ['อาหารและเครื่องดื่ม',
 const COLORS = ['#0f766e', '#1e293b', '#d97706', '#4f7cc4', '#8b5cf6', '#dc2626', '#65a30d', '#94a3b8'];
 const STORAGE_KEY = 'expense-tracker-config';
 const DEFAULT_CONFIG = { geminiKey: '', model: 'gemini-2.5-flash', supabaseUrl: '', supabaseKey: '' };
+const ENV_URL = process.env.NEXT_PUBLIC_SUPABASE_URL || '';
+const ENV_KEY = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || '';
 
 const inputCls = 'w-full rounded-lg border border-slate-300 bg-white px-3 py-2.5 text-base outline-none focus:border-teal-600 focus:ring-2 focus:ring-teal-600/30';
 const primaryCls = 'inline-flex items-center justify-center rounded-lg bg-teal-700 px-4 py-2.5 font-medium text-white hover:bg-teal-800 disabled:cursor-not-allowed disabled:opacity-50';
@@ -51,35 +53,52 @@ function normalize(input) {
   };
 }
 
-async function extractReceipt({ geminiKey, model }, file) {
-  const prompt = `อ่านใบเสร็จในรูปนี้ แล้วตอบเป็น JSON เท่านั้น ตามรูปแบบ:
+const PROMPT = `อ่านใบเสร็จในรูปนี้ แล้วตอบเป็น JSON เท่านั้น ตามรูปแบบ:
 {"shop_name": "ชื่อร้าน", "date": "YYYY-MM-DD (ค.ศ.)", "total": ตัวเลขยอดรวมสุทธิ, "category": "หนึ่งใน: ${CATEGORIES.join(', ')}"}
 ถ้าวันที่เป็น พ.ศ. ให้แปลงเป็น ค.ศ. ถ้าอ่านค่าใดไม่ได้ให้ใส่ null`;
 
+// ถ้ากรอก Gemini Key เอง จะเรียก Gemini ตรงจากเบราว์เซอร์
+// ถ้าเว้นว่าง จะเรียกผ่าน /api/extract (ใช้คีย์ของเซิร์ฟเวอร์ และต้องล็อกอิน)
+async function extractReceipt({ geminiKey, model }, file, token) {
   const imageData = await toBase64(file);
-  const res = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model.trim()}:generateContent`,
-    {
+  let text;
+  if (geminiKey.trim()) {
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${model.trim()}:generateContent`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': geminiKey.trim() },
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: PROMPT }, { inline_data: { mime_type: 'image/jpeg', data: imageData } }] }],
+          generationConfig: { responseMimeType: 'application/json', temperature: 0 },
+        }),
+      }
+    );
+    const data = await res.json();
+    if (!res.ok) throw new Error(data?.error?.message || `Gemini error ${res.status}`);
+    text = data?.candidates?.[0]?.content?.parts?.find((p) => p.text)?.text;
+  } else {
+    const res = await fetch('/api/extract', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': geminiKey.trim() },
-      body: JSON.stringify({
-        contents: [{ parts: [{ text: prompt }, { inline_data: { mime_type: 'image/jpeg', data: imageData } }] }],
-        generationConfig: { responseMimeType: 'application/json', temperature: 0 },
-      }),
-    }
-  );
-  const data = await res.json();
-  if (!res.ok) throw new Error(data?.error?.message || `Gemini error ${res.status}`);
-  const text = data?.candidates?.[0]?.content?.parts?.find((p) => p.text)?.text;
-  if (!text) throw new Error('Gemini ไม่ส่งข้อมูลกลับมา ลองถ่ายรูปให้ชัดขึ้น');
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ image: imageData }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `เซิร์ฟเวอร์ตอบกลับ ${res.status}`);
+    text = data.text;
+  }
+  if (!text) throw new Error('AI ไม่ส่งข้อมูลกลับมา ลองถ่ายรูปให้ชัดขึ้น');
   return normalize(JSON.parse(text.replace(/```json|```/g, '').trim()));
 }
 
 export default function Page() {
   const [config, setConfig] = useState(DEFAULT_CONFIG);
   const [form, setForm] = useState(DEFAULT_CONFIG);
-  const [openConfig, setOpenConfig] = useState(true);
+  const [openConfig, setOpenConfig] = useState(!(ENV_URL && ENV_KEY));
   const [loaded, setLoaded] = useState(false);
+  const [session, setSession] = useState(null);
+  const [auth, setAuth] = useState({ email: '', password: '' });
+  const [authBusy, setAuthBusy] = useState(false);
   const [preview, setPreview] = useState(null);
   const [reading, setReading] = useState(false);
   const [draft, setDraft] = useState(null);
@@ -97,7 +116,7 @@ export default function Page() {
         const c = { ...DEFAULT_CONFIG, ...saved };
         setConfig(c);
         setForm(c);
-        if (c.geminiKey && c.supabaseUrl && c.supabaseKey) setOpenConfig(false);
+        if (c.supabaseUrl && c.supabaseKey) setOpenConfig(false);
       }
     } catch (e) {}
     setLoaded(true);
@@ -108,19 +127,33 @@ export default function Page() {
     setTimeout(() => setToast(null), 4000);
   };
 
-  const ready = !!(config.geminiKey && config.supabaseUrl && config.supabaseKey);
+  const supaUrl = (config.supabaseUrl || ENV_URL).trim();
+  const supaKey = (config.supabaseKey || ENV_KEY).trim();
+  const ready = !!(supaUrl && supaKey);
 
   const supabase = useMemo(() => {
-    if (!config.supabaseUrl || !config.supabaseKey) return null;
+    if (!supaUrl || !supaKey) return null;
     try {
-      return createClient(config.supabaseUrl.trim(), config.supabaseKey.trim());
+      return createClient(supaUrl, supaKey);
     } catch (e) {
       return null;
     }
-  }, [config.supabaseUrl, config.supabaseKey]);
+  }, [supaUrl, supaKey]);
+
+  useEffect(() => {
+    if (!supabase) {
+      setSession(null);
+      return undefined;
+    }
+    supabase.auth.getSession().then(({ data }) => setSession(data.session));
+    const { data } = supabase.auth.onAuthStateChange((_event, s) => setSession(s));
+    return () => data.subscription.unsubscribe();
+  }, [supabase]);
+
+  const userId = session?.user?.id || null;
 
   async function loadExpenses() {
-    if (!supabase) return;
+    if (!supabase || !userId) return;
     setLoading(true);
     const { data, error } = await supabase
       .from('expenses')
@@ -134,8 +167,9 @@ export default function Page() {
   }
 
   useEffect(() => {
-    loadExpenses();
-  }, [supabase]);
+    if (userId) loadExpenses();
+    else setExpenses([]);
+  }, [supabase, userId]);
 
   function saveConfig() {
     setConfig(form);
@@ -144,15 +178,40 @@ export default function Page() {
     notify('บันทึกการตั้งค่าแล้ว');
   }
 
+  async function handleAuth(mode) {
+    if (!supabase) return notify('ยังไม่ได้ตั้งค่า Supabase', false);
+    if (!auth.email.trim() || auth.password.length < 6) return notify('กรอกอีเมลและรหัสผ่านอย่างน้อย 6 ตัวอักษร', false);
+    setAuthBusy(true);
+    const creds = { email: auth.email.trim(), password: auth.password };
+    if (mode === 'login') {
+      const { error } = await supabase.auth.signInWithPassword(creds);
+      if (error) notify(`เข้าสู่ระบบไม่สำเร็จ: ${error.message}`, false);
+    } else {
+      const { data, error } = await supabase.auth.signUp(creds);
+      if (error) notify(`สมัครไม่สำเร็จ: ${error.message}`, false);
+      else if (!data.session) notify('สมัครแล้ว กรุณายืนยันอีเมลก่อนเข้าสู่ระบบ');
+      else notify('สมัครสมาชิกสำเร็จ');
+    }
+    setAuthBusy(false);
+  }
+
+  async function handleLogout() {
+    await supabase.auth.signOut();
+    setDraft(null);
+    setPreview(null);
+    setExpenses([]);
+  }
+
   async function handleFile(e) {
     const file = e.target.files && e.target.files[0];
     e.target.value = '';
     if (!file) return;
-    if (!config.geminiKey) return notify('กรุณากรอก Gemini API Key ก่อน', false);
     setPreview(URL.createObjectURL(file));
     setReading(true);
     try {
-      setDraft(await extractReceipt(config, file));
+      const { data } = await supabase.auth.getSession();
+      const token = data.session?.access_token;
+      setDraft(await extractReceipt(config, file, token));
     } catch (err) {
       notify(`อ่านใบเสร็จไม่สำเร็จ: ${err.message}`, false);
     } finally {
@@ -200,15 +259,24 @@ export default function Page() {
 
   const setF = (k) => (e) => setForm({ ...form, [k]: e.target.value });
   const setD = (k) => (e) => setDraft({ ...draft, [k]: e.target.value });
+  const setA = (k) => (e) => setAuth({ ...auth, [k]: e.target.value });
   const draftValid = draft && draft.shop_name.trim() && draft.expense_date && Number(draft.amount) > 0;
 
   if (!loaded) return null;
 
   return (
     <main className="mx-auto max-w-5xl space-y-5 px-4 py-6 sm:px-6 lg:py-10">
-      <header>
-        <h1 className="text-2xl font-bold sm:text-3xl">AI Expense &amp; Receipt Tracker</h1>
-        <p className="mt-1 text-slate-600">ถ่ายใบเสร็จ ให้ AI อ่านข้อมูล แล้วบันทึกรายจ่ายของคุณ</p>
+      <header className="flex items-start justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-bold sm:text-3xl">AI Expense &amp; Receipt Tracker</h1>
+          <p className="mt-1 text-slate-600">ถ่ายใบเสร็จ ให้ AI อ่านข้อมูล แล้วบันทึกรายจ่ายของคุณ</p>
+        </div>
+        {session && (
+          <div className="shrink-0 text-right text-sm">
+            <p className="max-w-[10rem] truncate text-slate-600 sm:max-w-xs">{session.user.email}</p>
+            <button type="button" className="mt-1 text-teal-800 hover:underline" onClick={handleLogout}>ออกจากระบบ</button>
+          </div>
+        )}
       </header>
 
       {toast && (
@@ -226,12 +294,15 @@ export default function Page() {
         </button>
         {openConfig && (
           <div className="mt-4 grid gap-4 md:grid-cols-2">
+            <p className="text-sm text-slate-600 md:col-span-2">
+              เว้นว่างได้ ระบบจะใช้ค่าของเว็บเอง ถ้าต้องการใช้คีย์ของตัวเอง กรอกที่นี่
+            </p>
             <label className="block md:col-span-2">
               <span className="mb-1 block text-sm font-medium">Gemini API Key</span>
-              <input type="password" className={inputCls} value={form.geminiKey} onChange={setF('geminiKey')} placeholder="AIza..." autoComplete="off" />
+              <input type="password" className={inputCls} value={form.geminiKey} onChange={setF('geminiKey')} placeholder="AIza... (เว้นว่างเพื่อใช้ของเว็บ)" autoComplete="off" />
             </label>
             <label className="block">
-              <span className="mb-1 block text-sm font-medium">โมเดล Gemini</span>
+              <span className="mb-1 block text-sm font-medium">โมเดล Gemini (ใช้เมื่อกรอกคีย์เอง)</span>
               <input className={inputCls} value={form.model} onChange={setF('model')} />
             </label>
             <label className="block">
@@ -250,121 +321,149 @@ export default function Page() {
         )}
       </section>
 
-      <section className={cardCls}>
-        <h2 className="text-lg font-bold">สแกนใบเสร็จ</h2>
-        <div className="mt-4 grid gap-4 md:grid-cols-[1fr_16rem]">
-          <div className="flex flex-col gap-3 sm:flex-row md:flex-col">
-            <input ref={camRef} type="file" accept="image/*" capture="environment" className="hidden" onChange={handleFile} />
-            <input ref={fileRef} type="file" accept="image/*" className="hidden" onChange={handleFile} />
-            <button type="button" className={`${primaryCls} flex-1 py-4`} disabled={reading} onClick={() => camRef.current.click()}>ถ่ายภาพใบเสร็จ</button>
-            <button type="button" className={`${ghostCls} flex-1 py-4`} disabled={reading} onClick={() => fileRef.current.click()}>เลือกรูปจากเครื่อง</button>
-            {reading && <p className="self-center text-teal-800" role="status">AI กำลังอ่านใบเสร็จ...</p>}
-          </div>
-          <div className="flex h-48 items-center justify-center overflow-hidden rounded-xl bg-slate-100 ring-1 ring-slate-200 md:h-56">
-            {preview ? (
-              <img src={preview} alt="ใบเสร็จที่เลือก" className="h-full w-full object-contain" />
-            ) : (
-              <span className="px-4 text-center text-sm text-slate-500">รูปใบเสร็จจะแสดงที่นี่</span>
-            )}
-          </div>
-        </div>
-      </section>
-
-      {draft && (
-        <section className={`${cardCls} ring-2 ring-teal-600/40`}>
-          <h2 className="text-lg font-bold">ตรวจสอบและแก้ไขก่อนบันทึก</h2>
-          <div className="mt-4 grid gap-4 sm:grid-cols-2">
-            <label className="block sm:col-span-2">
-              <span className="mb-1 block text-sm font-medium">ชื่อร้าน</span>
-              <input className={inputCls} value={draft.shop_name} onChange={setD('shop_name')} />
-            </label>
-            <label className="block">
-              <span className="mb-1 block text-sm font-medium">วันที่</span>
-              <input type="date" className={inputCls} value={draft.expense_date} onChange={setD('expense_date')} />
-            </label>
-            <label className="block">
-              <span className="mb-1 block text-sm font-medium">ยอดเงินรวม (บาท)</span>
-              <input type="number" inputMode="decimal" min="0" step="0.01" className={inputCls} value={draft.amount} onChange={setD('amount')} />
-            </label>
-            <label className="block sm:col-span-2">
-              <span className="mb-1 block text-sm font-medium">หมวดหมู่</span>
-              <select className={inputCls} value={draft.category} onChange={setD('category')}>
-                {CATEGORIES.map((c) => <option key={c}>{c}</option>)}
-              </select>
-            </label>
-          </div>
-          <div className="mt-5 flex flex-col gap-3 sm:flex-row">
-            <button type="button" className={primaryCls} disabled={!draftValid || saving || !supabase} onClick={handleSave}>
-              {saving ? 'กำลังบันทึก...' : 'บันทึกรายจ่าย'}
-            </button>
-            <button type="button" className={ghostCls} onClick={() => setDraft(null)}>ยกเลิก</button>
-          </div>
-          {!supabase && <p className="mt-2 text-sm text-amber-700">กรอก Supabase URL และ Anon Key ด้านบนก่อนจึงจะบันทึกได้</p>}
+      {!session && (
+        <section className={cardCls}>
+          <h2 className="text-lg font-bold">เข้าสู่ระบบ</h2>
+          {!ready ? (
+            <p className="mt-3 text-amber-700">กรอก Supabase URL และ Anon Key ด้านบนก่อน</p>
+          ) : (
+            <div className="mt-4 grid gap-4 sm:grid-cols-2">
+              <label className="block">
+                <span className="mb-1 block text-sm font-medium">อีเมล</span>
+                <input type="email" className={inputCls} value={auth.email} onChange={setA('email')} autoComplete="email" />
+              </label>
+              <label className="block">
+                <span className="mb-1 block text-sm font-medium">รหัสผ่าน (อย่างน้อย 6 ตัว)</span>
+                <input type="password" className={inputCls} value={auth.password} onChange={setA('password')} autoComplete="current-password" />
+              </label>
+              <div className="flex flex-col gap-3 sm:col-span-2 sm:flex-row">
+                <button type="button" className={primaryCls} disabled={authBusy} onClick={() => handleAuth('login')}>เข้าสู่ระบบ</button>
+                <button type="button" className={ghostCls} disabled={authBusy} onClick={() => handleAuth('signup')}>สมัครสมาชิกใหม่</button>
+              </div>
+              <p className="text-sm text-slate-500 sm:col-span-2">รายจ่ายของแต่ละบัญชีเป็นส่วนตัว คนอื่นมองไม่เห็น</p>
+            </div>
+          )}
         </section>
       )}
 
-      <section className={cardCls}>
-        <div className="flex items-center justify-between">
-          <h2 className="text-lg font-bold">สรุปรายจ่าย</h2>
-          <button type="button" className={`${ghostCls} !px-3 !py-1.5 text-sm`} onClick={loadExpenses}>รีเฟรช</button>
-        </div>
-
-        {loading && <p className="mt-4 text-slate-500" role="status">กำลังโหลด...</p>}
-        {!loading && expenses.length === 0 && <p className="mt-4 text-slate-500">ยังไม่มีรายการ สแกนใบเสร็จใบแรกด้านบนได้เลย</p>}
-
-        {expenses.length > 0 && (
-          <>
-            <div className="mt-5 grid items-center gap-6 md:grid-cols-[14rem_1fr]">
-              <div className="relative mx-auto h-48 w-48 rounded-full" style={{ background: donut }} role="img" aria-label="กราฟวงกลมรายจ่ายตามหมวดหมู่">
-                <div className="absolute inset-8 flex flex-col items-center justify-center rounded-full bg-white text-center">
-                  <span className="text-xs text-slate-500">รวมทั้งหมด</span>
-                  <span className="text-lg font-bold">{baht(total)}</span>
-                </div>
+      {session && (
+        <>
+          <section className={cardCls}>
+            <h2 className="text-lg font-bold">สแกนใบเสร็จ</h2>
+            <div className="mt-4 grid gap-4 md:grid-cols-[1fr_16rem]">
+              <div className="flex flex-col gap-3 sm:flex-row md:flex-col">
+                <input ref={camRef} type="file" accept="image/*" capture="environment" className="hidden" onChange={handleFile} />
+                <input ref={fileRef} type="file" accept="image/*" className="hidden" onChange={handleFile} />
+                <button type="button" className={`${primaryCls} flex-1 py-4`} disabled={reading} onClick={() => camRef.current.click()}>ถ่ายภาพใบเสร็จ</button>
+                <button type="button" className={`${ghostCls} flex-1 py-4`} disabled={reading} onClick={() => fileRef.current.click()}>เลือกรูปจากเครื่อง</button>
+                {reading && <p className="self-center text-teal-800" role="status">AI กำลังอ่านใบเสร็จ...</p>}
               </div>
-              <ul className="space-y-3">
-                {rows.map((r) => (
-                  <li key={r.name}>
-                    <div className="flex justify-between text-sm">
-                      <span className="flex items-center gap-2"><i className="inline-block h-3 w-3 rounded-sm" style={{ background: r.color }} />{r.name}</span>
-                      <span>{baht(r.value)} ฿ ({Math.round((r.value / total) * 100)}%)</span>
-                    </div>
-                    <div className="mt-1 h-2 rounded-full bg-slate-100">
-                      <div className="h-2 rounded-full" style={{ width: `${(r.value / total) * 100}%`, background: r.color }} />
-                    </div>
-                  </li>
-                ))}
-              </ul>
+              <div className="flex h-48 items-center justify-center overflow-hidden rounded-xl bg-slate-100 ring-1 ring-slate-200 md:h-56">
+                {preview ? (
+                  <img src={preview} alt="ใบเสร็จที่เลือก" className="h-full w-full object-contain" />
+                ) : (
+                  <span className="px-4 text-center text-sm text-slate-500">รูปใบเสร็จจะแสดงที่นี่</span>
+                )}
+              </div>
+            </div>
+          </section>
+
+          {draft && (
+            <section className={`${cardCls} ring-2 ring-teal-600/40`}>
+              <h2 className="text-lg font-bold">ตรวจสอบและแก้ไขก่อนบันทึก</h2>
+              <div className="mt-4 grid gap-4 sm:grid-cols-2">
+                <label className="block sm:col-span-2">
+                  <span className="mb-1 block text-sm font-medium">ชื่อร้าน</span>
+                  <input className={inputCls} value={draft.shop_name} onChange={setD('shop_name')} />
+                </label>
+                <label className="block">
+                  <span className="mb-1 block text-sm font-medium">วันที่</span>
+                  <input type="date" className={inputCls} value={draft.expense_date} onChange={setD('expense_date')} />
+                </label>
+                <label className="block">
+                  <span className="mb-1 block text-sm font-medium">ยอดเงินรวม (บาท)</span>
+                  <input type="number" inputMode="decimal" min="0" step="0.01" className={inputCls} value={draft.amount} onChange={setD('amount')} />
+                </label>
+                <label className="block sm:col-span-2">
+                  <span className="mb-1 block text-sm font-medium">หมวดหมู่</span>
+                  <select className={inputCls} value={draft.category} onChange={setD('category')}>
+                    {CATEGORIES.map((c) => <option key={c}>{c}</option>)}
+                  </select>
+                </label>
+              </div>
+              <div className="mt-5 flex flex-col gap-3 sm:flex-row">
+                <button type="button" className={primaryCls} disabled={!draftValid || saving} onClick={handleSave}>
+                  {saving ? 'กำลังบันทึก...' : 'บันทึกรายจ่าย'}
+                </button>
+                <button type="button" className={ghostCls} onClick={() => setDraft(null)}>ยกเลิก</button>
+              </div>
+            </section>
+          )}
+
+          <section className={cardCls}>
+            <div className="flex items-center justify-between">
+              <h2 className="text-lg font-bold">สรุปรายจ่าย</h2>
+              <button type="button" className={`${ghostCls} !px-3 !py-1.5 text-sm`} onClick={loadExpenses}>รีเฟรช</button>
             </div>
 
-            <div className="mt-6 overflow-x-auto">
-              <table className="w-full min-w-[32rem] text-left">
-                <thead>
-                  <tr className="border-b border-slate-200 text-sm text-slate-500">
-                    <th className="py-2 pr-3 font-medium">วันที่</th>
-                    <th className="py-2 pr-3 font-medium">ร้าน</th>
-                    <th className="py-2 pr-3 font-medium">หมวดหมู่</th>
-                    <th className="py-2 pr-3 text-right font-medium">ยอดเงิน</th>
-                    <th className="py-2"><span className="sr-only">ลบ</span></th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {expenses.map((x) => (
-                    <tr key={x.id} className="border-b border-slate-100">
-                      <td className="whitespace-nowrap py-2.5 pr-3">{thDate(x.expense_date)}</td>
-                      <td className="py-2.5 pr-3">{x.shop_name}</td>
-                      <td className="py-2.5 pr-3">{x.category}</td>
-                      <td className="whitespace-nowrap py-2.5 pr-3 text-right font-medium">{baht(x.amount)}</td>
-                      <td className="py-2.5 text-right">
-                        <button type="button" className="text-sm text-red-600 hover:underline" onClick={() => handleDelete(x.id)}>ลบ</button>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          </>
-        )}
-      </section>
+            {loading && <p className="mt-4 text-slate-500" role="status">กำลังโหลด...</p>}
+            {!loading && expenses.length === 0 && <p className="mt-4 text-slate-500">ยังไม่มีรายการ สแกนใบเสร็จใบแรกด้านบนได้เลย</p>}
+
+            {expenses.length > 0 && (
+              <>
+                <div className="mt-5 grid items-center gap-6 md:grid-cols-[14rem_1fr]">
+                  <div className="relative mx-auto h-48 w-48 rounded-full" style={{ background: donut }} role="img" aria-label="กราฟวงกลมรายจ่ายตามหมวดหมู่">
+                    <div className="absolute inset-8 flex flex-col items-center justify-center rounded-full bg-white text-center">
+                      <span className="text-xs text-slate-500">รวมทั้งหมด</span>
+                      <span className="text-lg font-bold">{baht(total)}</span>
+                    </div>
+                  </div>
+                  <ul className="space-y-3">
+                    {rows.map((r) => (
+                      <li key={r.name}>
+                        <div className="flex justify-between text-sm">
+                          <span className="flex items-center gap-2"><i className="inline-block h-3 w-3 rounded-sm" style={{ background: r.color }} />{r.name}</span>
+                          <span>{baht(r.value)} ฿ ({Math.round((r.value / total) * 100)}%)</span>
+                        </div>
+                        <div className="mt-1 h-2 rounded-full bg-slate-100">
+                          <div className="h-2 rounded-full" style={{ width: `${(r.value / total) * 100}%`, background: r.color }} />
+                        </div>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+
+                <div className="mt-6 overflow-x-auto">
+                  <table className="w-full min-w-[32rem] text-left">
+                    <thead>
+                      <tr className="border-b border-slate-200 text-sm text-slate-500">
+                        <th className="py-2 pr-3 font-medium">วันที่</th>
+                        <th className="py-2 pr-3 font-medium">ร้าน</th>
+                        <th className="py-2 pr-3 font-medium">หมวดหมู่</th>
+                        <th className="py-2 pr-3 text-right font-medium">ยอดเงิน</th>
+                        <th className="py-2"><span className="sr-only">ลบ</span></th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {expenses.map((x) => (
+                        <tr key={x.id} className="border-b border-slate-100">
+                          <td className="whitespace-nowrap py-2.5 pr-3">{thDate(x.expense_date)}</td>
+                          <td className="py-2.5 pr-3">{x.shop_name}</td>
+                          <td className="py-2.5 pr-3">{x.category}</td>
+                          <td className="whitespace-nowrap py-2.5 pr-3 text-right font-medium">{baht(x.amount)}</td>
+                          <td className="py-2.5 text-right">
+                            <button type="button" className="text-sm text-red-600 hover:underline" onClick={() => handleDelete(x.id)}>ลบ</button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </>
+            )}
+          </section>
+        </>
+      )}
     </main>
   );
 }
