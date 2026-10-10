@@ -66,7 +66,7 @@ export async function POST(req) {
         return NextResponse.json({ text });
       }
       last = r;
-      if (r.res.status === 404) break; // ไม่พบโมเดลนี้ ลองตัวสำรอง
+      if (r.res.status === 404 || r.res.status === 429) break; // ไม่พบโมเดล หรือโควต้าเต็ม ข้ามไปตัวสำรอง
       if (!RETRYABLE.includes(r.res.status)) {
         return fail(r.data?.error?.message || `Gemini error ${r.res.status}`, 502);
       }
